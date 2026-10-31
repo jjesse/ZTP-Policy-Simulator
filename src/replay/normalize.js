@@ -19,24 +19,28 @@ function normAction(a) {
   return s.toUpperCase();
 }
 
-// Time: epoch seconds/ms, ISO, ctime ("Fri Oct 30 14:02:11 2026"), or "October 30, 2026 2:02:11 PM".
-// Zone is unknown for the text formats, so they are parsed as box-local and flagged.
-function parseTime(v, epoch) {
+// Time: epoch seconds/ms, ISO with zone, or zone-less text (ctime "Fri Oct 30 14:02:11 2026",
+// "October 30, 2026 2:02:11 PM", "2026-10-30 14:02:11"). Zone-less text is wall-clock in opts.tz (default Eastern).
+const { zonedToUtc, DEFAULT_TZ } = require('./tz');
+function parseTime(v, epoch, tz = DEFAULT_TZ) {
   const e = clean(epoch);
-  if (e && /^\d{9,13}$/.test(e)) { const n = Number(e); return { iso: new Date(n < 1e12 ? n * 1000 : n).toISOString(), tzKnown: true }; }
-  const s = clean(v); if (!s) return { iso: null, tzKnown: false };
-  if (/^\d{9,13}$/.test(s)) return parseTime(null, s);
-  const tzKnown = /(z|[+-]\d{2}:?\d{2})$/i.test(s);
-  const d = new Date(s.replace(/^(mon|tue|wed|thu|fri|sat|sun)\s+/i, ''));
-  return { iso: isNaN(d) ? null : d.toISOString(), tzKnown };
+  if (e && /^\d{9,13}$/.test(e)) { const n = Number(e); return { iso: new Date(n < 1e12 ? n * 1000 : n).toISOString(), tzSource: 'epoch' }; }
+  const s = clean(v); if (!s) return { iso: null, tzSource: null };
+  if (/^\d{9,13}$/.test(s)) return parseTime(null, s, tz);
+  if (/(z|[+-]\d{2}:?\d{2})$/i.test(s)) { const d = new Date(s); return { iso: isNaN(d) ? null : d.toISOString(), tzSource: 'explicit' }; }
+  // Parse wall-clock fields; the box zone does not matter because only the fields are read back.
+  const d = new Date(s.replace(/^(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+/i, '').replace(/^(\d{4}-\d{2}-\d{2})[ T]/, '$1T'));
+  if (isNaN(d)) return { iso: null, tzSource: null };
+  const ms = zonedToUtc(d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), tz);
+  return { iso: new Date(ms).toISOString(), tzSource: tz };
 }
 
-function record(f) {
-  const t = parseTime(f.time, f.epochtime);
+function record(f, opts = {}) {
+  const t = parseTime(f.time, f.epochtime, opts.tz || DEFAULT_TZ);
   const url = clean(f.url);
   const w = Number(f.weight);
   return {
-    time: t.iso, timeRaw: clean(f.time), tzKnown: t.tzKnown,
+    time: t.iso, timeRaw: clean(f.time), tzSource: t.tzSource,
     user: (clean(f.user) || '').toLowerCase() || null,
     dept: clean(f.dept), location: clean(f.location),
     url, host: (clean(f.host) || '').toLowerCase() || hostOf(url),
