@@ -118,4 +118,107 @@ test('proposedPolicy returns plan errors without applying', async () => {
   assert.strictEqual(res.ok, false); assert.ok(res.errors.length);
 });
 
-test('simulateDiff is still a fail-safe stub', () => assert.deepStrictEqual(R.simulateDiff(), { ok: false, status: 'not_implemented' }));
+
+// ---------- time zones ----------
+test('zone-less timestamps default to America/New_York (EDT and EST)', async () => {
+  const [a] = await collect(R.parseWebInsights(read('webinsights.csv')));
+  assert.strictEqual(a.time, '2026-10-30T18:02:11.000Z'); // 2:02:11 PM EDT
+  for (const f of ['nss.tsv', 'nss-lines.jsonl', 'nss-cloud.json']) {
+    const [x] = await collect(R.parseLogs(read(f)));
+    assert.strictEqual(x.time, '2026-10-30T18:02:11.000Z', f);
+  }
+  assert.strictEqual(R.record({ url: 'a.example.com', time: 'Mon Jan 12 09:00:00 2026' }).time, '2026-01-12T14:00:00.000Z'); // EST
+  assert.strictEqual(R.record({ url: 'a.example.com', time: '2026-11-01 01:30:00' }).time, '2026-11-01T05:30:00.000Z'); // fall-back day, first 1:30 (EDT)
+  assert.strictEqual(R.record({ url: 'a.example.com', time: '2026-10-30T14:00:00Z' }).time, '2026-10-30T14:00:00.000Z'); // explicit zone wins
+});
+
+test('time zone is configurable; invalid zones are rejected', async () => {
+  const [a] = await collect(R.parseLogs(read('nss.tsv'), { tz: 'UTC' }));
+  assert.strictEqual(a.time, '2026-10-30T14:02:11.000Z');
+  assert.strictEqual(R.record({ url: 'a.example.com', time: 'October 30, 2026 2:02:11 PM' }, { tz: 'America/Los_Angeles' }).time, '2026-10-30T21:02:11.000Z');
+  assert.throws(() => R.parseLogs('x', { tz: 'Not/AZone' }), /time zone/);
+  await assert.rejects(R.aggregate([], { tz: 'Not/AZone' }), /time zone/);
+});
+
+test('aggregate trend buckets by Eastern day (default) or the chosen zone', async () => {
+  const recs = () => [R.record({ user: 'alice@example.com', url: 'www.example.com/', time: '2026-10-31T02:30:00Z' })]; // 10:30 PM EDT Oct 30
+  assert.deepStrictEqual((await R.aggregate(recs()))[0].days, { '2026-10-30': 1 });
+  assert.deepStrictEqual((await R.aggregate(recs(), { tz: 'UTC' }))[0].days, { '2026-10-31': 1 });
+});
+
+// ---------- phase 3 ----------
+const rec = (o) => Object.assign(R.record(Object.assign({ time: '2026-10-30T15:00:00Z' }, o)), o.weight ? { weight: o.weight } : {});
+async function blockedProposal() {
+  const live = demo();
+  const res = await R.proposedPolicy({ data: live }, blockSpec);
+  assert.ok(res.ok);
+  return { live, proposed: res.data };
+}
+
+test('simulateDiff: newly blocked, unaffected, and already blocked by another engine', async () => {
+  const { live, proposed } = await blockedProposal();
+  const records = await R.aggregate([
+    rec({ user: 'carol@example.com', dept: 'Engineering', location: 'HQ', url: 'blocked.example.com/a', urlcat: 'News', action: 'Allowed', weight: 3 }),
+    rec({ user: 'carol@example.com', dept: 'Engineering', location: 'HQ', url: 'blocked.example.com/a', urlcat: 'News', action: 'Allowed', time: '2026-10-31T02:30:00Z' }),
+    rec({ user: 'dan@example.com', dept: 'Sales', location: 'Branch-1', url: 'blocked.example.com/b', urlcat: 'News', action: 'Allowed', weight: 2 }),
+    rec({ user: 'erin@example.com', dept: 'Sales', location: 'Branch-1', url: 'blocked.example.com/c', urlcat: 'News', action: 'Blocked', ruleType: 'Firewall Filtering', blockedBy: 'FW_Block_Test' }),
+    rec({ user: 'alice@example.com', dept: 'Engineering', location: 'HQ', url: 'news.example.com/', urlcat: 'News', action: 'Allowed', weight: 7 }),
+  ]);
+  const d = R.simulateDiff(records, { data: live }, { data: proposed });
+  assert.ok(d.ok); assert.strictEqual(d.tz, 'America/New_York');
+  const nb = d.newlyBlocked;
+  assert.strictEqual(nb.transactions, 6); assert.strictEqual(nb.distinctUsers, 2);
+  assert.deepStrictEqual(nb.topHosts, [{ key: 'blocked.example.com', weight: 6 }]);
+  assert.deepStrictEqual(nb.departments, [{ key: 'Engineering', weight: 4 }, { key: 'Sales', weight: 2 }]);
+  assert.deepStrictEqual(nb.trend, [{ day: '2026-10-30', weight: 6 }]); // 02:30Z Oct 31 is still Oct 30 Eastern
+  assert.deepStrictEqual(nb.rules, [{ key: 'Replay-Block', weight: 6 }]);
+  assert.strictEqual(nb.confidence.high, 6);
+  assert.strictEqual(d.alreadyBlocked.transactions, 1);
+  assert.strictEqual(d.alreadyBlocked.rows[0].alreadyBlockedBy, 'FW_Block_Test');
+  assert.strictEqual(d.alreadyBlocked.rows[0].blockedByEngine, 'Firewall Filtering');
+  assert.strictEqual(d.newlyAllowed.transactions, 0);
+  assert.strictEqual(d.totals.transactions, 14); assert.strictEqual(d.totals.changedTransactions, 7);
+});
+
+test('simulateDiff: removing a block shows newly allowed records', async () => {
+  const { live, proposed } = await blockedProposal();
+  const records = [rec({ user: 'carol@example.com', url: 'blocked.example.com/a', urlcat: 'News', action: 'Blocked', ruleType: 'URL Filtering', blockedBy: 'Replay-Block', weight: 4 })];
+  const d = R.simulateDiff(records, proposed, live);
+  assert.strictEqual(d.newlyAllowed.transactions, 4);
+  assert.strictEqual(d.newlyAllowed.rows[0].current, 'BLOCK'); assert.strictEqual(d.newlyAllowed.rows[0].proposed, 'ALLOW');
+  assert.strictEqual(d.newlyBlocked.transactions, 0);
+});
+
+test('simulateDiff: confidence drops when a relevant rule depends on group membership or time windows', async () => {
+  const { live, proposed } = await blockedProposal();
+  // Demo rule "Block Social for Guests" (group-scoped) sits ahead of the new block for social-category traffic.
+  const social = [rec({ user: 'carol@example.com', url: 'blocked.example.com/s', urlcat: 'Social Networking', action: 'Allowed' })];
+  let d = R.simulateDiff(social, live, proposed);
+  assert.strictEqual(d.newlyBlocked.confidence.low, 1);
+  assert.ok(d.newlyBlocked.rows[0].confidence.reasons.includes('group membership'));
+  // Directory groups supplied -> no longer a guess.
+  d = R.simulateDiff(social, live, proposed, { groupsByUser: { 'carol@example.com': ['Engineering'] } });
+  assert.strictEqual(d.newlyBlocked.confidence.high, 1);
+  // Category rules out the group-scoped rule -> high.
+  d = R.simulateDiff([rec({ user: 'carol@example.com', url: 'blocked.example.com/n', urlcat: 'News', action: 'Allowed' })], live, proposed);
+  assert.strictEqual(d.newlyBlocked.confidence.high, 1);
+  // Time window on the deciding rule.
+  const timed = JSON.parse(JSON.stringify(proposed));
+  const rule = timed.urlFilteringRules.find((r) => r.name === 'Replay-Block');
+  for (const r of timed.urlFilteringRules) r.order += 1;
+  timed.urlFilteringRules.push(Object.assign({}, rule, { id: 999, name: 'Allow-After-Hours', action: 'ALLOW', order: 1, timeWindows: [{ id: 1, name: 'Evenings' }] }));
+  const deny = timed;
+  const res = R.simulateDiff([rec({ user: 'carol@example.com', url: 'blocked.example.com/n', urlcat: 'News', action: 'Allowed' })], live, deny);
+  const rows = res.newlyBlocked.rows;
+  assert.strictEqual(rows.length, 1); assert.strictEqual(rows[0].confidence.level, 'low');
+  assert.ok(rows[0].confidence.reasons.includes('time window'));
+});
+
+test('simulateDiff validates inputs and caches identical evaluations', async () => {
+  const { live, proposed } = await blockedProposal();
+  assert.throws(() => R.simulateDiff([], live), /snapshots/);
+  assert.throws(() => R.simulateDiff([], live, proposed, { tz: 'Nope/Zone' }), /time zone/);
+  const rows = Array.from({ length: 50 }, () => rec({ user: 'carol@example.com', url: 'blocked.example.com/a', urlcat: 'News', action: 'Allowed' }));
+  const d = R.simulateDiff(rows, live, proposed);
+  assert.strictEqual(d.totals.uniqueEvaluations, 1); assert.strictEqual(d.newlyBlocked.transactions, 50);
+});

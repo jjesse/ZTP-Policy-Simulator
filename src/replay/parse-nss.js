@@ -8,11 +8,11 @@ const FIELD = { time: 'time', epochtime: 'epochtime', login: 'user', elogin: 'us
 const HEX = new Set(['elogin', 'eurl']);
 const dehex = (s) => { try { return /^([0-9a-f]{2})+$/i.test(s) ? Buffer.from(s, 'hex').toString('utf8') : s; } catch { return s; } };
 
-function fromNss(obj) {
+function fromNss(obj, opts = {}) {
   const ev = obj && typeof obj.event === 'object' && obj.event ? obj.event : obj;
   const f = {};
   for (const [k, v] of Object.entries(ev || {})) { const t = FIELD[k]; if (t && f[t] == null) f[t] = HEX.has(k) ? dehex(String(v)) : v; }
-  return record(f);
+  return record(f, opts);
 }
 
 // Default TSV field list = Research's synthetic custom format; override with opts.fields (NSS variable names).
@@ -31,7 +31,7 @@ async function* parseNssTsv(src, opts = {}, stats = {}) {
     if (!line.trim()) continue;
     const cells = line.split('\t');
     const o = {}; fields.forEach((f, i) => { o[f] = cells[i] == null ? '' : decodeURIComponentSafe(cells[i]); });
-    const r = fromNss(o);
+    const r = fromNss(o, opts);
     if (!r.host) { stats.skipped++; continue; }
     stats.rows++; yield r;
   }
@@ -39,12 +39,12 @@ async function* parseNssTsv(src, opts = {}, stats = {}) {
 function decodeURIComponentSafe(s) { try { return /%[0-9a-f]{2}/i.test(s) ? decodeURIComponent(s) : s; } catch { return s; } }
 
 // JSON lines and JSON arrays (one array per line/batch, or a pretty-printed array spanning many lines).
-async function* parseNssJson(src, stats = {}) {
+async function* parseNssJson(src, stats = {}, opts = {}) {
   stats.rows = 0; stats.skipped = 0;
   let buf = '', depth = 0, inStr = false, esc = false;
   const emit = function* (text) {
     let v; try { v = JSON.parse(text); } catch { stats.skipped++; return; }
-    for (const o of Array.isArray(v) ? v : [v]) { const r = fromNss(o); if (r.host) { stats.rows++; yield r; } else stats.skipped++; }
+    for (const o of Array.isArray(v) ? v : [v]) { const r = fromNss(o, opts); if (r.host) { stats.rows++; yield r; } else stats.skipped++; }
   };
   // Scan characters, emitting each top-level object; array brackets at depth 0 are ignored so huge arrays stream.
   for await (const line of linesOf(src)) {

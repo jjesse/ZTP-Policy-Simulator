@@ -29,7 +29,7 @@ function mapHeader(cells) {
 }
 
 // Yields normalized records. stats (optional object) receives { rows, skipped, header, unknownColumns }.
-async function* parseWebInsights(src, stats = {}) {
+async function* parseWebInsights(src, stats = {}, opts = {}) {
   let map = null; stats.rows = 0; stats.skipped = 0;
   for await (const cells of csvRows(src)) {
     if (!map) {
@@ -39,7 +39,7 @@ async function* parseWebInsights(src, stats = {}) {
     }
     const f = {};
     map.forEach((k, i) => { if (k && f[k] == null) f[k] = cells[i]; });
-    const r = record(f);
+    const r = record(f, opts);
     if (!r.host) { stats.skipped++; continue; }
     stats.rows++;
     yield r;

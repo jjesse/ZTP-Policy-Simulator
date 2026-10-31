@@ -1,10 +1,12 @@
 'use strict';
-// Impact replay (see docs/impact-replay-plan.md). Phases 1-2 done: log parsing + aggregation, offline proposed policy.
-// simulateDiff (phase 3) is still a fail-safe stub.
+// Impact replay (see docs/impact-replay-plan.md). Phases 1-3: log parsing + aggregation, offline proposed policy, diff.
+// Zone-less timestamps and trend days use opts.tz (default America/New_York, DST-aware).
 const { parseWebInsights } = require('./parse-webinsights');
 const { parseNssJson, parseNssTsv, fieldsFrom } = require('./parse-nss');
 const { proposedPolicy } = require('./proposed');
 const { record } = require('./normalize');
+const { DEFAULT_TZ, dayIn, validTz } = require('./tz');
+const { simulateDiff, confidenceOf, contextOf } = require('./diff');
 
 const NOT_IMPLEMENTED = Object.freeze({ ok: false, status: 'not_implemented' });
 const RECORD_FIELDS = ['time', 'user', 'dept', 'location', 'url', 'host', 'urlcat', 'action', 'ruleType', 'blockedBy', 'urlRule', 'clientIp', 'weight'];
@@ -13,12 +15,13 @@ const RECORD_FIELDS = ['time', 'user', 'dept', 'location', 'url', 'host', 'urlca
 const KEY_FIELDS = ['user', 'dept', 'location', 'host', 'url', 'urlcat', 'action', 'blockedBy'];
 const aggregateKey = (r) => KEY_FIELDS.map((k) => (r[k] == null ? '' : String(r[k]).toLowerCase())).join('|');
 
-async function aggregate(records) {
+async function aggregate(records, { tz = DEFAULT_TZ } = {}) {
+  if (!validTz(tz)) throw new Error(`unknown time zone: ${tz}`);
   const groups = new Map();
   const add = (r) => {
     const k = aggregateKey(r);
     const w = Number.isFinite(r.weight) && r.weight > 0 ? r.weight : 1;
-    const day = r.time ? String(r.time).slice(0, 10) : 'unknown';
+    const day = r.time ? dayIn(r.time, tz) : 'unknown';
     let g = groups.get(k);
     if (!g) { g = Object.assign({}, r, { weight: 0, days: {} }); delete g.time; delete g.timeRaw; groups.set(k, g); }
     g.weight += w; g.days[day] = (g.days[day] || 0) + w;
@@ -35,14 +38,13 @@ function sniff(text) {
   if (l.includes('\t') && !l.includes(',')) return 'nss-tsv';
   return 'webinsights';
 }
-function parseLogs(src, { format = 'auto', fields } = {}, stats = {}) {
+function parseLogs(src, { format = 'auto', fields, tz = DEFAULT_TZ } = {}, stats = {}) {
+  if (!validTz(tz)) throw new Error(`unknown time zone: ${tz}`);
   const f = format === 'auto' ? (typeof src === 'string' ? sniff(src) : null) : format;
-  if (f === 'webinsights') return parseWebInsights(src, stats);
-  if (f === 'nss-json') return parseNssJson(src, stats);
-  if (f === 'nss-tsv') return parseNssTsv(src, { fields }, stats);
+  if (f === 'webinsights') return parseWebInsights(src, stats, { tz });
+  if (f === 'nss-json') return parseNssJson(src, stats, { tz });
+  if (f === 'nss-tsv') return parseNssTsv(src, { fields, tz }, stats);
   throw new Error(`unknown or unsniffable log format: ${format}`);
 }
 
-function simulateDiff(/* currentSnap, proposedSnap, records, opts */) { return NOT_IMPLEMENTED; }
-
-module.exports = { RECORD_FIELDS, aggregateKey, aggregate, parseLogs, sniff, parseWebInsights, parseNssJson, parseNssTsv, fieldsFrom, proposedPolicy, record, simulateDiff, NOT_IMPLEMENTED };
+module.exports = { RECORD_FIELDS, aggregateKey, aggregate, parseLogs, sniff, parseWebInsights, parseNssJson, parseNssTsv, fieldsFrom, proposedPolicy, record, simulateDiff, confidenceOf, contextOf, DEFAULT_TZ, NOT_IMPLEMENTED };
